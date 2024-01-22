@@ -262,11 +262,17 @@ class NextTokenModel(nn.Module):
         ])
 
         self.actions_enc = nn.ModuleDict({
-            f'action_enc_{key}': nn.Linear(value, hidden_dim) for key, value in action_dict.items()
+            f'action_enc_{key}': nn.Sequential(*[
+                nn.Linear(value, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, hidden_dim),
+            ]) for key, value in action_dict.items()
         })
-        self.value_head = nn.Linear(hidden_dim, 1)
-
-        self.state_head = nn.Linear(hidden_dim, hidden_dim)
+        self.value_head = nn.Sequential(*[
+            nn.Linear(hidden_dim, 4 * hidden_dim),
+            nn.GELU(),
+            nn.Linear(4 * hidden_dim, 1),
+        ])
 
         self.memory = {}
         self.max_memory_size = max_memory_size
@@ -309,17 +315,16 @@ class NextTokenModel(nn.Module):
             action_vectors.append(self.actions_enc[f'action_enc_{action}'](torch.tensor([self.action_dict[action]]).to(device)))
         action_vectors = torch.stack(action_vectors).unsqueeze(0)
 
-        # interlace the vectors with the actions, so it goes v_0, a_0, v_1, a_1, ..., v_n, a_n with target_vector at the end
         vectors = torch.stack((selected_vectors, action_vectors), dim=1)
         vectors = vectors.reshape(-1, vectors.shape[-1])
         vectors = torch.cat((self.start_token, vectors, target_vector), dim=0)
         vectors = vectors + self.positional_embeddings[:vectors.shape[0]].unsqueeze(1)
 
-        vectors = self.transformer_blocks(vectors, is_causal=True)
+        vectors = self.transformer_blocks(vectors, is_causal=True)[0]
 
-        value_prediction = self.value_head(vectors[0])
+        value_prediction = self.value_head(vectors)
 
-        memory_losses = F.mse_loss(value_prediction[1:], memory_rewards[indices].unsqueeze(1), reduction='none').squeeze(1)
+        memory_losses = F.mse_loss(value_prediction[:-1], memory_rewards[indices].unsqueeze(1), reduction='none').squeeze(1)
 
         memory_actions = []
         for i, index in enumerate(indices):
@@ -328,8 +333,8 @@ class NextTokenModel(nn.Module):
             memory_actions.append(self.memory[memory_key]['actions'])
 
         return {
-            'output_vectors': vectors[-1],
-            'next_vectors': vectors[1:],
+            'output_vectors': vectors,
+            'memory_next_vectors': memory_next_vectors[indices],
             'value_prediction': value_prediction[0],
             'memory_losses': memory_losses,
             'memory_actions': memory_actions,
@@ -471,7 +476,7 @@ class AnimalGuy(nn.Module):
 
         self.hidden_dim = hidden_dim
         self.action_dict = action_dict
-        self.num_state_tokens = 1
+        self.num_state_tokens = 2
 
         self.vision = Vision(
             hidden_dim=hidden_dim,
@@ -480,7 +485,11 @@ class AnimalGuy(nn.Module):
             num_layers=num_layers,
         )
 
-        self.vision_to_next = nn.Linear(hidden_dim, hidden_dim)
+        self.vision_to_next = nn.Sequential(*[
+            nn.Linear(hidden_dim, 4 * hidden_dim),
+            nn.GELU(),
+            nn.Linear(4 * hidden_dim, hidden_dim),
+        ])
 
         self.next_token_model = NextTokenModel(
             hidden_dim=hidden_dim,
@@ -492,10 +501,18 @@ class AnimalGuy(nn.Module):
         )
 
         self.action_heads = nn.ModuleDict({
-            f'action_{key}': nn.Linear(hidden_dim, value) for key, value in action_dict.items()
+            f'action_{key}': nn.Sequential(*[
+                nn.Linear(hidden_dim, 4 * hidden_dim),
+                nn.GELU(),
+                nn.Linear(4 * hidden_dim, value),
+            ]) for key, value in action_dict.items()
         })
-        self.env_value_head = nn.Linear(hidden_dim, 1)
-        self.inner_value_head = nn.Linear(hidden_dim, 1)
+         # TODO split this into a Linear(hidden_dim, 2*hidden_dim) to handle next state probabilistically (i.e. with a mean and variance)
+        self.state_head = nn.Sequential(*[
+            nn.Linear(hidden_dim, 4 * hidden_dim),
+            nn.GELU(),
+            nn.Linear(4 * hidden_dim, hidden_dim),
+        ])
 
         self.rollout_length = rollout_length
         self.rollout_length_so_far = 0
@@ -518,34 +535,47 @@ class AnimalGuy(nn.Module):
         self.losses_accumulated = 0 
 
     def forward(self, image, reward, debug=False, device='cpu'):
-        state = torch.zeros(1, 1, self.hidden_dim).to(device)
+        encoded_reward = self.env_reward_enc(torch.tensor([reward]).to(device))
+        state = torch.cat([torch.zeros(1, 1, self.hidden_dim).to(device), encoded_reward], dim=1)
 
         x = self.vision(image, state, device=device)
-        x = self.vision_to_next(x)
+        x = self.vision_to_next(x[:, 0])
+
         output = None
         value_prediction = None
         memory_losses = None
         memory_actions = None
         memory_rewards = None
-        if len(self.limbic_system.memory) > 0:
-            limbic_output = self.limbic_system(x[:, 0], device=device)
-            output = limbic_output['output_vectors']
-            value_prediction = limbic_output['value_prediction']
-            memory_losses = limbic_output['memory_losses']
-            memory_actions = limbic_output['memory_actions']
-            memory_rewards = limbic_output['memory_rewards']
+        if len(self.next_token_model.memory) > 0:
+            model_output = self.next_token_model(x, device=device)
+            output = model_output['output_vectors']
+            value_prediction = model_output['value_prediction']
+            memory_next_vectors = model_output['memory_next_vectors']
+            memory_losses = model_output['memory_losses']
+            memory_actions = model_output['memory_actions']
+            memory_rewards = model_output['memory_rewards']
+
+            state_indices = torch.arange(0, len(output)) * 2
+            action_indices = torch.arange(0, len(output)) * 2 + 1
+            state_inputs = output[state_indices]
+            action_inputs = output[action_indices]
 
         if output is None:
-            output = x[:, 0]
-            value_prediction = self.limbic_system.value_head(output)
+            output = x
+            value_prediction = self.next_token_model.value_head(output)
 
-        actions_vecs = {key: head(output) for key, head in self.action_heads.items()}
+            action_inputs = output
+
+            memory_next_vectors = None
+            state_inputs = None
+
+        actions_vecs = {key: head(action_inputs) for key, head in self.action_heads.items()}
 
         actions = {}
         all_actions_with_distributions = []
         for action in actions_vecs:
             distributions = torch.softmax(actions_vecs[action], dim=-1)
-            actions[action] = torch.multinomial(distributions[0], 1)[0].cpu().item()
+            actions[action] = torch.multinomial(distributions[-1], 1)[0].cpu().item()
 
             actions_taken = [actions[action]]
             if memory_actions is not None:
@@ -570,23 +600,24 @@ class AnimalGuy(nn.Module):
 
             surprise = F.mse_loss(self.rollouts['env_values'][0][1].squeeze().to(device), env_returns[0], reduction='none').item()
 
-            exploration_bonus = 0.1 * self.limbic_system.get_intrinsic_reward(self.rollouts['states'][0][1], surprise, device=device)
+            exploration_bonus = 0.1 * self.next_token_model.get_intrinsic_reward(self.rollouts['states'][0][1], surprise, device=device)
 
             self.rollouts['rewards'][-1] = (self.rollouts['rewards'][-1][0], self.rollouts['rewards'][-1][1] + exploration_bonus)
             env_returns[0] = env_returns[0] + (self.decay ** (self.rollout_length - 1)) * exploration_bonus
             
-            self.limbic_system.add_memory(self.rollouts['states'][0][1], {action[0]: action[1] for action in self.rollouts['actions'][0][1]}, env_returns[0], self.rollouts['env_values'][0][1], device=device)
+            self.next_token_model.add_memory(self.rollouts['states'][0][1], self.rollouts['states'][1][1], {action[0]: action[1] for action in self.rollouts['actions'][0][1]}, env_returns[0], self.rollouts['env_values'][0][1], device=device)
 
-            all_returns.append(env_returns[0])
             if memory_rewards is not None:
                 for memory_reward in memory_rewards:
                     all_returns.append(memory_reward)
+            all_returns.append(env_returns[0])
+
         if len(all_returns) > 0:
             all_returns = torch.stack(all_returns).to(device)
 
         stepped = False
         if self.rollout_length_so_far >= self.rollout_length:
-            stepped = self.learn(all_actions_with_distributions, all_returns, memory_losses, device=device)
+            stepped = self.learn(all_actions_with_distributions, all_returns, memory_losses, state_inputs, memory_next_vectors, device=device)
             if stepped:
                 output = output.detach()
                 self.rollout_length_so_far = 0
@@ -615,8 +646,8 @@ class AnimalGuy(nn.Module):
                 actions_to_return[action_name] -= 5
         return actions_to_return
 
-    def learn(self, all_actions, all_returns, memory_losses=None, device='cpu'):
-        
+    def learn(self, all_actions, all_returns, memory_losses, state_inputs, target_next_states, device='cpu'):
+
         policy_losses = []
         entropy_losses = []
         if all_actions is not None:
@@ -627,11 +658,14 @@ class AnimalGuy(nn.Module):
         policy_loss = torch.cat(policy_losses).mean()
         entropy_loss = torch.stack(entropy_losses).mean()
 
-        value_loss = F.mse_loss(self.rollouts['env_values'][0][1].squeeze().to(device), all_returns[0], reduction='none')
+        value_loss = F.mse_loss(self.rollouts['env_values'][0][1].squeeze().to(device), all_returns[-1], reduction='none')
         if memory_losses is not None:
             value_loss = torch.cat((value_loss.unsqueeze(0), memory_losses)).mean()
 
-        loss = 1 * policy_loss + 1 * value_loss + 0.001 * entropy_loss
+        predicted_states = self.state_head(state_inputs)
+        state_loss = F.mse_loss(predicted_states, target_next_states, reduction='none').mean()
+
+        loss = 1 * policy_loss + 1 * value_loss + 1 * state_loss + 0.001 * entropy_loss
         print(f'After {self.n_optimizer_steps} steps and {self.n_forwards} forwards, loss: {loss.item():.3f}, policy_loss: {policy_loss.item():.3f}, value_loss: {value_loss.item():.3f}, entropy_loss: {entropy_loss.item():.3f}')
 
         # warmup the optimizer over the first 10 steps
