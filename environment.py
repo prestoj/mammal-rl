@@ -5,7 +5,8 @@ import minerl
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from mammal import Mammal
+# from mammal import Mammal
+from next_token_rl import AnimalGuy
 import gc
 import multiprocessing
 
@@ -25,19 +26,21 @@ action_space = {
 def worker(env_name, queue):
     device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
 
-    model = Mammal(
+    model = AnimalGuy(
         hidden_dim=384,
         num_heads=6,
-        num_layers=6,
+        num_layers=3,
         action_dict=action_space,
+        device=device,
     )
     model = model.to(device)
     checkpoint = torch.load('model_and_optimizer.pth')
     model.load_state_dict(checkpoint['model_state_dict'])
     model.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
     model.n_optimizer_steps = checkpoint['n_optimizer_steps']
-    model.limbic_system.memory = checkpoint['memory']
+    model.next_token_model.memory = checkpoint['memory']
     model = model.to(device)
+    model.train()
 
     print('Number of parameters:', sum(p.numel() for p in model.parameters() if p.requires_grad))
 
@@ -78,7 +81,7 @@ def worker(env_name, queue):
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': model.optimizer.state_dict(),
         'n_optimizer_steps': model.n_optimizer_steps,
-        'memory': model.limbic_system.memory,
+        'memory': model.next_token_model.memory,
     }, 'model_and_optimizer.pth')
 
 
@@ -104,11 +107,12 @@ def main():
 
 
 if __name__ == '__main__':
-    # model = Mammal(
+    # model = AnimalGuy(
     #     hidden_dim=384,
     #     num_heads=6,
-    #     num_layers=6,
+    #     num_layers=3,
     #     action_dict=action_space,
+    #     device='cuda:0',
     # )
     # model = model.to('cuda:0')
     # print('Number of parameters:', sum(p.numel() for p in model.parameters() if p.requires_grad))
@@ -117,7 +121,7 @@ if __name__ == '__main__':
     #     'model_state_dict': model.state_dict(),
     #     'optimizer_state_dict': model.optimizer.state_dict(),
     #     'n_optimizer_steps': model.n_optimizer_steps,
-    #     'memory': model.limbic_system.memory,
+    #     'memory': model.next_token_model.memory,
     # }, 'model_and_optimizer.pth')
 
     main()

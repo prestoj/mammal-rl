@@ -196,7 +196,7 @@ class Vision(nn.Module):
         self.num_heads = num_heads
         self.num_state_tokens = num_state_tokens
 
-        self.vision = timm.create_model('vit_small_patch16_224.augreg_in21k', pretrained=True)
+        self.vision = timm.create_model('vit_small_patch16_224.augreg_in21k_ft_in1k', pretrained=True)
         data_config = timm.data.resolve_model_data_config(self.vision)
         self.transforms = timm.data.create_transform(**data_config, is_training=False)
 
@@ -211,6 +211,8 @@ class Vision(nn.Module):
             Block(
                 dim=hidden_dim,
                 num_heads=num_heads,
+                proj_drop=0.2,
+                attn_drop=0.2,
             ) for _ in range(num_layers)
         ])
 
@@ -249,28 +251,33 @@ class NextTokenModel(nn.Module):
         self.action_dict = action_dict
 
         self.start_token = nn.Parameter(torch.rand(1, hidden_dim) * 2 - 1)
-        self.positional_embeddings = nn.Parameter(torch.rand(memories_fetched_per_step + 1, hidden_dim) * 2 - 1)
+        self.positional_embeddings = nn.Parameter(torch.rand(memories_fetched_per_step * 2 + 2, hidden_dim) * 2 - 1)
 
-        self.transformer_blocks = nn.Sequential(*[
+        self.transformer_blocks = nn.TransformerEncoder(
             nn.TransformerEncoderLayer(
                 d_model=hidden_dim,
                 nhead=num_heads,
                 dim_feedforward=hidden_dim * 4,
                 activation='gelu',
                 norm_first=True,
-            ) for _ in range(num_layers)
-        ])
+                dropout=0.2,
+            ),
+            num_layers=num_layers,
+            mask_check=False,
+        )
 
         self.actions_enc = nn.ModuleDict({
             f'action_enc_{key}': nn.Sequential(*[
                 nn.Linear(value, hidden_dim),
                 nn.GELU(),
+                nn.Dropout(0.2),
                 nn.Linear(hidden_dim, hidden_dim),
             ]) for key, value in action_dict.items()
         })
         self.value_head = nn.Sequential(*[
             nn.Linear(hidden_dim, 4 * hidden_dim),
             nn.GELU(),
+            nn.Dropout(0.2),
             nn.Linear(4 * hidden_dim, 1),
         ])
 
@@ -284,11 +291,11 @@ class NextTokenModel(nn.Module):
             return x.unsqueeze(0)
 
         with torch.no_grad():
-            memory_keys, memory_values = zip(*self.memory.items())
+            memory_keys, memory_values = zip(*sorted(self.memory.items(), key=lambda x: x[1]['time']))
             memory_vectors = torch.stack([mv['vector'] for mv in memory_values]).to(device)
             memory_next_vectors = torch.stack([mv['next_vector'] for mv in memory_values]).to(device)
             memory_surprises = torch.tensor([mv['surprise'] for mv in memory_values]).to(device)
-            memory_similarities = torch.cosine_similarity(x.unsqueeze(0), memory_vectors, dim=-1)[:, 0]
+            memory_similarities = torch.cosine_similarity(x, memory_vectors, dim=-1)
             memory_rewards = torch.tensor([mv['reward'] for mv in memory_values]).to(device)
 
             surprise_score = NextTokenModel._get_scores(memory_surprises) ** 2
@@ -305,26 +312,33 @@ class NextTokenModel(nn.Module):
                 self.memory[memory_key]['time_last_recall'] = current_time
 
         selected_vectors = memory_vectors[indices]
-        selected_vectors = selected_vectors.squeeze(1).unsqueeze(0).detach()
+        selected_vectors = selected_vectors.squeeze(1).squeeze(1).detach()
 
-        target_vector = x.unsqueeze(0)
+        target_vector = x
 
         # convert actions to vectors
         action_vectors = []
         for action in self.action_dict:
-            action_vectors.append(self.actions_enc[f'action_enc_{action}'](torch.tensor([self.action_dict[action]]).to(device)))
-        action_vectors = torch.stack(action_vectors).unsqueeze(0)
+            action_vector = torch.zeros(selected_vectors.shape[0], self.action_dict[action]).to(device)
+            for i, index in enumerate(indices):
+                memory_key = memory_keys[index]
+                action_vector[i, self.memory[memory_key]['actions'][f'action_{action}']] = 1
+            action_vectors.append(self.actions_enc[f'action_enc_{action}'](action_vector))
+
+        action_vectors = torch.stack(action_vectors).mean(0)
 
         vectors = torch.stack((selected_vectors, action_vectors), dim=1)
         vectors = vectors.reshape(-1, vectors.shape[-1])
         vectors = torch.cat((self.start_token, vectors, target_vector), dim=0)
-        vectors = vectors + self.positional_embeddings[:vectors.shape[0]].unsqueeze(1)
+        vectors = vectors + self.positional_embeddings[:vectors.shape[0]]
 
-        vectors = self.transformer_blocks(vectors, is_causal=True)[0]
+        mask = nn.Transformer.generate_square_subsequent_mask(vectors.shape[0], device=device)
 
-        value_prediction = self.value_head(vectors)
+        vectors = self.transformer_blocks(vectors, mask=mask)
 
-        memory_losses = F.mse_loss(value_prediction[:-1], memory_rewards[indices].unsqueeze(1), reduction='none').squeeze(1)
+        value_indices = torch.arange(0, len(selected_vectors) + 1) * 2 + 1
+        value_prediction = self.value_head(vectors[value_indices])
+        memory_losses = F.mse_loss(value_prediction[:-1].flatten(), memory_rewards[indices].flatten(), reduction='none')
 
         memory_actions = []
         for i, index in enumerate(indices):
@@ -333,12 +347,12 @@ class NextTokenModel(nn.Module):
             memory_actions.append(self.memory[memory_key]['actions'])
 
         return {
-            'output_vectors': vectors,
+            'output_vectors': vectors[1:],
             'memory_next_vectors': memory_next_vectors[indices],
-            'value_prediction': value_prediction[0],
-            'memory_losses': memory_losses,
+            'value_prediction': value_prediction[-1],
+            'memory_losses': memory_losses.flatten(),
             'memory_actions': memory_actions,
-            'memory_rewards': memory_rewards[indices],
+            'memory_rewards': memory_rewards[indices].flatten(),
         }
     
     def highest_similarity_score(self, x, device='cpu'):
@@ -348,7 +362,7 @@ class NextTokenModel(nn.Module):
         with torch.no_grad():
             _, memory_values = zip(*self.memory.items())
             memory_vectors = torch.stack([mv['vector'] for mv in memory_values]).to(device)
-            memory_similarities = torch.cosine_similarity(x.unsqueeze(0), memory_vectors, dim=-1)[:, 0]
+            memory_similarities = torch.cosine_similarity(x, memory_vectors, dim=-1)
 
         max_similarity, index = torch.max(memory_similarities, dim=0)
         max_similarity = max_similarity.item()
@@ -363,21 +377,14 @@ class NextTokenModel(nn.Module):
             _, memory_values = zip(*self.memory.items())
             memory_vectors = torch.stack([mv['vector'] for mv in memory_values]).to(device)
 
-            memory_similarities = torch.cosine_similarity(x.unsqueeze(0), memory_vectors, dim=-1)[:, 0]
+            memory_similarities = torch.cosine_similarity(x, memory_vectors, dim=-1)
+            memory_max_similarities = torch.tensor([mv['max_similarity'] for mv in memory_values]).to(device)
 
-            memory_surprises = torch.tensor([mv['surprise'] for mv in memory_values]).to(device)
+            # memory_surprises = torch.tensor([mv['surprise'] for mv in memory_values]).to(device)
 
-            memory_rewards = torch.tensor([mv['reward'] for mv in memory_values]).to(device)
-            memory_reward_scores = NextTokenModel._get_scores(memory_rewards)
-
-            if len(memory_similarities) > 100:
-                high_reward_scores = memory_reward_scores[torch.topk(memory_similarities, int(0.01 * len(memory_similarities)), dim=0)[1]]
-            else:
-                high_reward_scores = torch.tensor([0.0]).to(device)
-
-            score = (memory_surprises < surprise).float().mean()
-            score = score + high_reward_scores.mean()
-            score = score / 2
+            # score = (memory_surprises < surprise).float().mean()
+            score = (memory_max_similarities > memory_similarities.max().item()).float().mean()
+            # score = score / 2
 
         return float(score.item())
 
@@ -387,8 +394,9 @@ class NextTokenModel(nn.Module):
         reward = float(reward)
         expected_reward = float(expected_reward)
         reward_surprise = F.mse_loss(torch.tensor([reward]).to(device), torch.tensor([expected_reward]).to(device), reduction='none').item()
-        state_surprise = F.mse_loss(state_vector, next_state_vector, reduction='none').mean().item()
-        surprise = (reward_surprise + state_surprise) / 2
+        # state_surprise = F.mse_loss(state_vector, next_state_vector, reduction='none').mean().item()
+        # surprise = (reward_surprise + state_surprise) / 2
+        surprise = reward_surprise
 
         if not self.memory:
             memory_uid = str(uuid.uuid4())
@@ -470,7 +478,8 @@ class AnimalGuy(nn.Module):
             num_heads,
             num_layers,
             action_dict,
-            rollout_length=20,
+            rollout_length=16,
+            device='cpu',
     ):
         super(AnimalGuy, self).__init__()
 
@@ -488,6 +497,7 @@ class AnimalGuy(nn.Module):
         self.vision_to_next = nn.Sequential(*[
             nn.Linear(hidden_dim, 4 * hidden_dim),
             nn.GELU(),
+            nn.Dropout(0.2),
             nn.Linear(4 * hidden_dim, hidden_dim),
         ])
 
@@ -495,8 +505,8 @@ class AnimalGuy(nn.Module):
             hidden_dim=hidden_dim,
             num_heads=num_heads,
             num_layers=num_layers,
-            memories_fetched_per_step=128,
-            max_memory_size=8192,
+            memories_fetched_per_step=64,
+            max_memory_size=1024,
             action_dict=action_dict,
         )
 
@@ -511,6 +521,7 @@ class AnimalGuy(nn.Module):
         self.state_head = nn.Sequential(*[
             nn.Linear(hidden_dim, 4 * hidden_dim),
             nn.GELU(),
+            nn.Dropout(0.2),
             nn.Linear(4 * hidden_dim, hidden_dim),
         ])
 
@@ -523,19 +534,20 @@ class AnimalGuy(nn.Module):
             'states': [],
         }
 
-        self.decay = 0.95
+        self.decay = 0.99
 
         self.env_reward_enc = nn.Linear(1, hidden_dim)
 
-        self.max_lr = 1e-3
-        self.optimizer = torch.optim.AdamW(self.parameters(), lr=self.max_lr)
+        self.max_lr = 1e-4
+        self.optimizer = torch.optim.AdamW(self.parameters(), lr=self.max_lr, weight_decay=1e-5)
         self.n_optimizer_steps = 0
 
         self.n_forwards = 0
         self.losses_accumulated = 0 
 
     def forward(self, image, reward, debug=False, device='cpu'):
-        encoded_reward = self.env_reward_enc(torch.tensor([reward]).to(device))
+        reward = float(reward)
+        encoded_reward = self.env_reward_enc(torch.tensor([reward]).to(device)).unsqueeze(0).unsqueeze(0)
         state = torch.cat([torch.zeros(1, 1, self.hidden_dim).to(device), encoded_reward], dim=1)
 
         x = self.vision(image, state, device=device)
@@ -555,14 +567,15 @@ class AnimalGuy(nn.Module):
             memory_actions = model_output['memory_actions']
             memory_rewards = model_output['memory_rewards']
 
-            state_indices = torch.arange(0, len(output)) * 2
-            action_indices = torch.arange(0, len(output)) * 2 + 1
+            state_indices = torch.arange(1, len(output), 2)
+            action_indices = torch.arange(0, len(output), 2)
+
             state_inputs = output[state_indices]
             action_inputs = output[action_indices]
 
         if output is None:
             output = x
-            value_prediction = self.next_token_model.value_head(output)
+            value_prediction = self.next_token_model.value_head(output)[0]
 
             action_inputs = output
 
@@ -586,7 +599,7 @@ class AnimalGuy(nn.Module):
         self.rollouts['rewards'].append((self.n_forwards, reward))
         self.rollouts['actions'].append((self.n_forwards, sorted(actions.items())))
         self.rollouts['env_values'].append((self.n_forwards, value_prediction))
-        self.rollouts['states'].append((self.n_forwards, output[:1].detach()))
+        self.rollouts['states'].append((self.n_forwards, output[-1].detach()))
         self.rollout_length_so_far += 1
 
         all_returns = []
@@ -600,7 +613,7 @@ class AnimalGuy(nn.Module):
 
             surprise = F.mse_loss(self.rollouts['env_values'][0][1].squeeze().to(device), env_returns[0], reduction='none').item()
 
-            exploration_bonus = 0.1 * self.next_token_model.get_intrinsic_reward(self.rollouts['states'][0][1], surprise, device=device)
+            exploration_bonus = 0.0 * self.next_token_model.get_intrinsic_reward(self.rollouts['states'][0][1], surprise, device=device)
 
             self.rollouts['rewards'][-1] = (self.rollouts['rewards'][-1][0], self.rollouts['rewards'][-1][1] + exploration_bonus)
             env_returns[0] = env_returns[0] + (self.decay ** (self.rollout_length - 1)) * exploration_bonus
@@ -647,30 +660,36 @@ class AnimalGuy(nn.Module):
         return actions_to_return
 
     def learn(self, all_actions, all_returns, memory_losses, state_inputs, target_next_states, device='cpu'):
-
+        
         policy_losses = []
         entropy_losses = []
         if all_actions is not None:
             for memory_action in all_actions:
                 policy_losses.append(-torch.log(memory_action[1][0, memory_action[2]] + 1e-5) * all_returns)
                 entropy_losses.append(torch.mean(-torch.log(memory_action[1] + 1e-5)))
-        
+
         policy_loss = torch.cat(policy_losses).mean()
         entropy_loss = torch.stack(entropy_losses).mean()
 
-        value_loss = F.mse_loss(self.rollouts['env_values'][0][1].squeeze().to(device), all_returns[-1], reduction='none')
+        value_loss = F.mse_loss(self.rollouts['env_values'][0][1].to(device), all_returns[-1:], reduction='none')
         if memory_losses is not None:
-            value_loss = torch.cat((value_loss.unsqueeze(0), memory_losses)).mean()
+            value_loss = torch.cat((value_loss, memory_losses)).mean()
 
-        predicted_states = self.state_head(state_inputs)
-        state_loss = F.mse_loss(predicted_states, target_next_states, reduction='none').mean()
+        if state_inputs is not None:
+            predicted_states = self.state_head(state_inputs)
+            state_loss = F.mse_loss(predicted_states, target_next_states.detach(), reduction='none').mean()
+        else:
+            state_loss = torch.tensor([0.0]).to(device)
 
-        loss = 1 * policy_loss + 1 * value_loss + 1 * state_loss + 0.001 * entropy_loss
-        print(f'After {self.n_optimizer_steps} steps and {self.n_forwards} forwards, loss: {loss.item():.3f}, policy_loss: {policy_loss.item():.3f}, value_loss: {value_loss.item():.3f}, entropy_loss: {entropy_loss.item():.3f}')
+        loss = 1 * policy_loss + 1 * value_loss + 1 * state_loss + 1e-5 * entropy_loss
+        # print(f'After {self.n_optimizer_steps} steps and {self.n_forwards} forwards, loss: {loss.item():.3f}, policy_loss: {policy_loss.item():.3f}, value_loss: {value_loss.item():.3f}, entropy_loss: {entropy_loss.item():.3f}')
+        print(f'After {self.n_optimizer_steps} steps and {self.n_forwards} forwards, loss: {loss.item():.3f}, policy_loss: {policy_loss.item():.3f}, value_loss: {value_loss.item():.3f}, state_loss: {state_loss.item():.3f}, entropy_loss: {entropy_loss.item():.3f}')
 
-        # warmup the optimizer over the first 10 steps
-        if self.n_optimizer_steps <= 10:
-            lr = self.max_lr * (self.n_optimizer_steps / 10)
+        loss = loss / self.rollout_length
+
+        # warmup the optimizer over the first 1000 steps
+        if self.n_optimizer_steps <= 1000:
+            lr = self.max_lr * (self.n_optimizer_steps / 1000)
             for param_group in self.optimizer.param_groups:
                 param_group['lr'] = lr
 
@@ -682,7 +701,6 @@ class AnimalGuy(nn.Module):
             self.optimizer.zero_grad()
             torch.cuda.empty_cache()
             self.n_optimizer_steps += 1
-            self.recurrent_state = (self.recurrent_state[0].detach(), self.recurrent_state[1].detach())
             stepped = True
             self.losses_accumulated = 0
         else:
@@ -693,7 +711,6 @@ class AnimalGuy(nn.Module):
 
     def reset(self, device):
         self.optimizer.zero_grad()
-        self.recurrent_state = (torch.zeros(1, self.hidden_dim).to(device), torch.zeros(1, self.hidden_dim).to(device))
         self.rollouts['rewards'] = []
         self.rollouts['actions'] = []
         self.rollouts['env_values'] = []

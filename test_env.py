@@ -5,7 +5,7 @@ import minerl
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from mammal import Mammal
+from next_token_rl import AnimalGuy
 import gc
 import multiprocessing
 import time
@@ -27,30 +27,37 @@ action_space = {
 def worker(env_name, queue):
     device = 'cuda:1' if torch.cuda.is_available() else 'cpu'
 
-    model = Mammal(
+    model = AnimalGuy(
         hidden_dim=384,
         num_heads=6,
-        num_layers=6,
+        num_layers=3,
         action_dict=action_space,
+        device=device,
     )
     model = model.to(device)
     checkpoint = torch.load('model_and_optimizer.pth', map_location=device)
     model.load_state_dict(checkpoint['model_state_dict'])
     model.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
     model.n_optimizer_steps = checkpoint['n_optimizer_steps']
-    model.limbic_system.memory = checkpoint['memory']
-    # for uid in model.limbic_system.memory:
-    #     print(f"{uid}, {model.limbic_system.memory[uid]['reward']:.3f}, {model.limbic_system.memory[uid]['surprise']:.3f}, {model.limbic_system.memory[uid]['max_similarity']:.3f}")
-    # convert limbic system memory attributes to pd dataframe and sort by reward, only looking at reward surprise and max_similarity
-    df = pd.DataFrame.from_dict(model.limbic_system.memory, orient='index')
+    model.next_token_model.memory = checkpoint['memory']
+
+    vectors = []
+    for uuid in model.next_token_model.memory:
+        if "vector" in model.next_token_model.memory[uuid]:  # Ensure the key exists before accessing
+            vector = model.next_token_model.memory[uuid]["vector"]
+            vectors.append(vector.detach().cpu().numpy())
+
+    # iterate through vectors and calculate the cosine similarity between it and the whole memory
+    vectors = np.array(vectors)
+    similarities = []
+    for vector in vectors:
+        similarities.append(np.dot(vector, vectors.T) / (np.linalg.norm(vector) * np.linalg.norm(vectors, axis=1)))
+    print(np.mean(similarities), np.std(similarities))
+
+    df = pd.DataFrame.from_dict(model.next_token_model.memory, orient='index')
     df = df.sort_values(by=['reward'], ascending=False)
     df = df[['reward', 'surprise', 'max_similarity']]
     print(df.head(20))
-
-    # count the number of rewards less than 0.001
-    print((df['reward'] < 0.001).sum())
-    
-    model = model.to(device)
 
     # Assuming 'model' is your neural network model
     mean_weights = []
@@ -131,7 +138,7 @@ def worker(env_name, queue):
         obs, reward, done, info = env.step(actions)
 
         # # reward the model for seeing red, making sure to exclude "white" where green and blue are also high
-        # reward += float((image[:, :, 0] / (image.sum(axis=2) + 1e-5)).mean())
+        # reward += 1 - float((image[:, :, 0] / (image.sum(axis=2) + 1e-5)).mean())
 
         # if np.random.rand() < 0.01:
         #     if actions['forward'] == 0:
@@ -154,8 +161,9 @@ def worker(env_name, queue):
         #         reward += 1
         #     if actions['camera'][1] == 0:
         #         reward += 1
-        # if step_reward > 0:
-        #     print('Reward:', step_reward)
+
+        if step_reward > 0:
+            print('Reward:', step_reward)
 
         step_reward = reward
 
