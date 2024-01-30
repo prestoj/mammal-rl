@@ -5,14 +5,15 @@ from torchvision import transforms
 from PIL import Image
 from timm.models.vision_transformer import VisionTransformer
 import random
-import torch
-from torchvision.datasets import CIFAR10
-from torch.utils.data import DataLoader
-from torch.utils.data import Subset
+from torchvision.transforms import RandAugment
+import math
+import matplotlib.pyplot as plt
 
 class MIMVisionModel(nn.Module):
     def __init__(
-            self, 
+            self,
+            image_size,
+            patch_size,
             hidden_dim,
             num_heads,
             num_layers_encode,
@@ -25,8 +26,8 @@ class MIMVisionModel(nn.Module):
         self.num_layers_encode = num_layers_encode
         self.num_layers_decode = num_layers_decode
         self.device = device
-        self.image_size = 32
-        self.patch_size = 4
+        self.image_size = image_size
+        self.patch_size = patch_size
 
         self.vision_model_encode = VisionTransformer(
             img_size=self.image_size,
@@ -118,78 +119,161 @@ class MIMVisionModel(nn.Module):
 
         return x, mask
 
-if __name__ == "__main__":
-    import torch.nn as nn
-    import torch.optim as optim
-    import matplotlib.pyplot as plt
+class VisionManager():
+    def __init__(
+        self,
+        image_size,
+        patch_size,
+        hidden_dim,
+        num_heads,
+        num_layers_encode,
+        num_layers_decode,
+        device,
+        max_lr=1e-4,
+        batch_size=32,
+        warmup_steps=10000,
+        total_steps=100000,
+        ema_decay=0.999
+    ):
+        self.device = device
 
-    transforms = transforms.Compose([
-        transforms.Resize((32, 32)),
-        # RandAugment(2, 9),
-        transforms.ToTensor(),
-        transforms.Normalize((0.5, 0.5, 0.5), (0.25, 0.25, 0.25)),
-    ])
+        self.model = MIMVisionModel(
+            image_size,
+            patch_size,
+            hidden_dim,
+            num_heads,
+            num_layers_encode,
+            num_layers_decode,
+            device
+        )
+        self.model = self.model.to(device)
+        self.model.train()
 
-    # Define your training dataset
-    train_dataset = CIFAR10(root='./data', train=True, transform=transforms, download=True)
-    train_loader = DataLoader(train_dataset, batch_size=1024, shuffle=True)
+        self.ema_model = MIMVisionModel(
+            image_size,
+            patch_size,
+            hidden_dim,
+            num_heads,
+            num_layers_encode,
+            num_layers_decode,
+            device
+        )
+        self.ema_model = self.ema_model.to(device)
+        self.ema_model.eval()
+
+        self.ema_decay = ema_decay
+
+        self.train_transforms = transforms.Compose([
+            transforms.Resize((image_size, image_size)),
+            RandAugment(2, 9),
+            transforms.ToTensor(),
+            transforms.Normalize((0.5, 0.5, 0.5), (0.25, 0.25, 0.25)),
+        ])
+
+        self.test_transforms = transforms.Compose([
+            transforms.Resize((image_size, image_size)),
+            transforms.ToTensor(),
+            transforms.Normalize((0.5, 0.5, 0.5), (0.25, 0.25, 0.25)),
+        ])
+
+        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=0)
+        self.criterion = nn.MSELoss()
+
+        self.image_queue = torch.zeros((batch_size, 3, image_size, image_size)).to(device)
+        self.image_queue_marker = 0
+
+        self.step = 0
+        self.warmup_steps = warmup_steps
+        self.total_steps = total_steps
+        self.max_lr = max_lr
+        self.cosine_decay_steps = self.total_steps - self.warmup_steps
+
+        plt.ion()
+        self.fig, (self.ax1, self.ax2) = plt.subplots(1, 2)
+
+    def update_learning_rate(self):
+        self.step += 1
+
+        if self.step <= self.warmup_steps:
+            lr = self.max_lr * self.step / self.warmup_steps
+        else:
+            lr = self.max_lr * 0.5 * (1 + math.cos(math.pi * (self.step - self.warmup_steps) / self.cosine_decay_steps))
+
+        for param_group in self.optimizer.param_groups:
+            param_group['lr'] = lr
+
+    def process_image_for_learning(self, image):
+        image = Image.fromarray(image)
+        image = self.train_transforms(image)
+
+        self.image_queue[self.image_queue_marker] = image
+        self.image_queue_marker += 1
+        if self.image_queue_marker == self.image_queue.shape[0]:
+            self.learn()
     
-    # Define your model
-    model = MIMVisionModel(hidden_dim=192, num_heads=3, num_layers_encode=6, num_layers_decode=6, device='cuda')
-    model = nn.DataParallel(model)
-    model = model.to('cuda')
+    def learn(self):
+        self.update_learning_rate()
 
-    # print out number of parameters in the model
-    print('Number of parameters:', sum(p.numel() for p in model.parameters() if p.requires_grad))
+        self.optimizer.zero_grad()
 
-    # Define your loss function and optimizer
-    criterion = nn.MSELoss()
-    max_lr = 1e-3
-    warmup_steps = 10000
-    optimizer = optim.AdamW(model.parameters(), lr=0)
+        reconstructions, mask = self.model(self.image_queue)
+        loss = self.criterion(reconstructions[~mask], self.image_queue[~mask])
 
-    plt.ion()
-    fig, axes = plt.subplots(1, 2)
+        print(self.step, self.step * self.image_queue.shape[0], loss.item())
 
-    # Training loop
-    num_epochs = 1000
-    step = 0
-    for epoch in range(num_epochs):
-        for batch_idx, (images, _) in enumerate(train_loader):
-            step += 1
-            images = images.to('cuda')
-            # Forward pass
-            reconstructions, mask = model(images, mask_ratio=0.5)
+        if self.step % 5 == 0:
+            # visualize
+            self.images_queue = self.image_queue * 0.25 + 0.5
+            reconstructions = reconstructions * 0.25 + 0.5
+            self.images_queue = self.images_queue.float().clamp(0, 1)
+            reconstructions = reconstructions.float().clamp(0, 1)
 
-            # Compute the loss
-            loss = criterion(reconstructions[~mask], images[~mask])
+            self.images_queue[~mask] = 0.5
+            reconstructions[mask] = 0.5
 
-            print(f"Epoch [{epoch+1}/{num_epochs}], Step [{batch_idx+1}/{len(train_loader)}], Loss: {loss.item()}")
+            self.ax1.imshow(self.images_queue[0].permute(1, 2, 0).cpu().numpy())
+            self.ax2.imshow(reconstructions[0].permute(1, 2, 0).detach().cpu().numpy())
+            plt.pause(0.1)
 
-            if step <= warmup_steps:
-                lr = max_lr * step / warmup_steps
-                for param_group in optimizer.param_groups:
-                    param_group['lr'] = lr
+        loss.backward()
+        self.optimizer.step()
 
-            # Backward pass and optimization
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+        with torch.no_grad():
+            for param, ema_param in zip(self.model.parameters(), self.ema_model.parameters()):
+                ema_param.data.mul_(self.ema_decay).add_(param.data, alpha=1 - self.ema_decay)
+        
+        self.image_queue_marker = 0
+        self.image_queue = torch.zeros_like(self.image_queue).to(self.device)
 
-            if step % 100 == 0:
-                # Visualize
-                images = images * 0.25 + 0.5
-                reconstructions = reconstructions * 0.25 + 0.5
-                images = images.float().clamp(0, 1)
-                reconstructions = reconstructions.float().clamp(0, 1)
+    def input_image(self, image):
+        self.process_image_for_learning(image)
 
-                # apply mask
-                images[~mask] = 0.5
-                reconstructions[mask] = 0.5
+        image = Image.fromarray(image)
+        image = self.test_transforms(image)
+        image = image.unsqueeze(0).to(self.device)
 
-                axes[0].imshow(images[0].cpu().permute(1, 2, 0))
-                axes[1].imshow(reconstructions[0].detach().cpu().permute(1, 2, 0))
-                plt.pause(0.1)
+        with torch.no_grad():
+            reconstructions, _ = self.ema_model.forward_encode(image, mask_ratio=1.0)
+            reconstructions = reconstructions.squeeze(0)
+        
+        return reconstructions
 
-        print(f"Epoch [{epoch+1}/{num_epochs}], Loss: {loss.item()}")
-
+    def save(self, path):
+        torch.save({
+            'model_state_dict': self.model.state_dict(),
+            'ema_model_state_dict': self.ema_model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'step': self.step
+        }, path)
+    
+    def load(self, path):
+        checkpoint = torch.load(path)
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+        self.ema_model.load_state_dict(checkpoint['ema_model_state_dict'])
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        self.step = checkpoint['step']
+        self.model = self.model.to(self.device)
+        self.ema_model = self.ema_model.to(self.device)
+        self.model.train()
+        self.ema_model.eval()
+        
