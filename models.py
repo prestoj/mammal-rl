@@ -104,7 +104,7 @@ class MIMVisionModel(nn.Module):
 
         return x
     
-    def forward(self, x, mask_ratio=0.5):
+    def forward(self, x, mask_ratio):
         B, C, H, W = x.shape
         x, mask = self.forward_encode(x, mask_ratio)
         x = self.forward_decode(x, mask)
@@ -119,7 +119,7 @@ class MIMVisionModel(nn.Module):
 
         return x, mask
 
-class VisionManager():
+class VisionManager:
     def __init__(
         self,
         image_size,
@@ -216,7 +216,7 @@ class VisionManager():
 
         self.optimizer.zero_grad()
 
-        reconstructions, mask = self.model(self.image_queue)
+        reconstructions, mask = self.model(self.image_queue, mask_ratio=0.25)
         loss = self.criterion(reconstructions[~mask], self.image_queue[~mask])
 
         print(self.step, self.step * self.image_queue.shape[0], loss.item())
@@ -276,4 +276,43 @@ class VisionManager():
         self.ema_model = self.ema_model.to(self.device)
         self.model.train()
         self.ema_model.eval()
-        
+
+class WorldModel(nn.Module):
+    def __init__(
+        self,
+        image_size,
+        hidden_dim,
+        num_heads,
+        num_layers,
+        actions_dict,
+        device
+    ):
+        super(WorldModel, self).__init__()
+        self.device = device
+        self.action_dict = actions_dict
+
+        self.transformer = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(
+                d_model=hidden_dim,
+                nhead=num_heads,
+                dim_feedforward=hidden_dim*4,
+            ),
+            num_layers
+        )
+
+        self.action_embeddings = nn.ModuleDict({
+            f'{key}_{value}': nn.Parameter(torch.rand(hidden_dim)) for key in actions_dict for value in range(actions_dict[key])
+        })
+
+        self.action_heads = nn.ModuleDict({
+            key: nn.Linear(hidden_dim, value) for key, value in actions_dict.items()
+        })
+
+        self.vision_head = nn.Linear(hidden_dim, image_size*image_size*3)
+
+    def forward(self, state, actions):
+        B, N, C = state.shape
+
+        action_embeddings = torch.zeros((B, N, C)).to(self.device)
+        for key in actions:
+            action_embeddings += actions[key].unsqueeze(1).repeat(1, N, 1) * self.action_embeddings[key]
