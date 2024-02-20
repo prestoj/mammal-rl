@@ -5,41 +5,39 @@ import minerl
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from models import VisionManager
+from models import WorldManager
 import gc
 import multiprocessing
 
 action_space = {
-    "forward": 2,
-    "back": 2,
-    "left": 2,
-    "right": 2,
-    "jump": 2,
-    "sneak": 2,
-    "sprint": 2,
-    "attack": 2,
-    "camera_0": 11,
-    "camera_1": 11,
+    "action_forward": 2,
+    "action_back": 2,
+    "action_left": 2,
+    "action_right": 2,
+    "action_jump": 2,
+    "action_sneak": 2,
+    "action_sprint": 2,
+    "action_attack": 2,
+    "action_camera_0": 11,
+    "action_camera_1": 11,
 }
 
 def worker(env_name, queue):
     device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
 
-    vision = VisionManager(
+    model = WorldManager(
         image_size=64,
-        patch_size=8,
+        patch_size=4,
         hidden_dim=384,
         num_heads=6,
-        num_layers_encode=6,
-        num_layers_decode=6,
+        num_layers=4,
+        num_vision_encode_layers=4,
+        num_vision_decode_layers=2,
+        actions_dict=action_space,
         device=device,
-        max_lr=1e-4,
-        batch_size=32,
-        warmup_steps=10000,
-        total_steps=100000,
-        ema_decay=0.999
     )
-    vision.load('vision.pth')
+    model.load('world.pth', 'vision.pth')
+
 
     env = gym.make(env_name)
     obs = env.reset()
@@ -56,14 +54,10 @@ def worker(env_name, queue):
         # get the image from the observation
         image = obs['pov']
 
-        vision.input_image(image)
-
-        # random action
-        actions = {}
-        for key in action_space:
-            actions[key] = np.random.randint(action_space[key])
-            if key == 'camera_0' or key == 'camera_1':
-                actions[key] = np.random.randint(-5, 6)
+        actions = model.get_action_from_environment(image, step_reward)
+        
+        # remove 'action_' from the keys
+        actions = {k.replace('action_', ''): v for k, v in actions.items()}
 
         # combine camera_0 and camera_1 into a single action
         actions['camera'] = [actions['camera_0'], actions['camera_1']]
@@ -78,7 +72,7 @@ def worker(env_name, queue):
 
     env.close()
     
-    vision.save('vision.pth')
+    model.save('world.pth', 'vision.pth')
 
 
 def main():
@@ -103,21 +97,21 @@ def main():
 
 
 if __name__ == '__main__':
-    # vision = VisionManager(
+    # model = WorldManager(
     #     image_size=64,
-    #     patch_size=8,
+    #     patch_size=4,
     #     hidden_dim=384,
     #     num_heads=6,
-    #     num_layers_encode=6,
-    #     num_layers_decode=6,
-    #     device='cuda:0',
-    #     max_lr=1e-4,
-    #     batch_size=32,
-    #     warmup_steps=10000,
-    #     total_steps=100000,
-    #     ema_decay=0.999
+    #     num_layers=4,
+    #     num_vision_encode_layers=4,
+    #     num_vision_decode_layers=2,
+    #     actions_dict=action_space,
+    #     device='cuda:0' if torch.cuda.is_available() else 'cpu',
     # )
 
-    # vision.save('vision.pth')
+    # model.save('world.pth', 'vision.pth')
+
+    # print('Number of parameters in world model: %d' % sum(p.numel() for p in model.model.parameters() if p.requires_grad))
+    # print('Number of parameters in vision model: %d' % sum(p.numel() for p in model.vision_manager.model.parameters() if p.requires_grad))
 
     main()
