@@ -9,6 +9,8 @@ from models import WorldManager
 import gc
 import multiprocessing
 
+TEST = 0
+
 action_space = {
     "action_forward": 2,
     "action_back": 2,
@@ -23,21 +25,25 @@ action_space = {
 }
 
 def worker(env_name, queue):
-    device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
+    if TEST:
+        device = 'cuda:1'
+    else:
+        device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
 
     model = WorldManager(
         image_size=64,
-        patch_size=4,
-        hidden_dim=384,
-        num_heads=6,
-        num_layers=4,
-        num_vision_encode_layers=4,
-        num_vision_decode_layers=2,
+        patch_size=8,
+        hidden_dim=768,
+        num_heads=12,
+        num_layers=12,
+        num_vision_encode_layers=12,
+        num_vision_decode_layers=4,
         actions_dict=action_space,
         device=device,
     )
     model.load('world.pth', 'vision.pth')
-
+    if TEST:
+        model.SARS_dataset = []
 
     env = gym.make(env_name)
     obs = env.reset()
@@ -46,6 +52,8 @@ def worker(env_name, queue):
     step_reward = 0
     i = 0
     while not done:
+        if TEST:
+            env.render()
         i += 1
         if i % 5 != 1:
             obs, reward, done, info = env.step(actions)
@@ -59,8 +67,8 @@ def worker(env_name, queue):
         # remove 'action_' from the keys
         actions = {k.replace('action_', ''): v for k, v in actions.items()}
 
-        # combine camera_0 and camera_1 into a single action
-        actions['camera'] = [actions['camera_0'], actions['camera_1']]
+        # combine camera_0 anSARS_datasetd camera_1 into a single action
+        actions['camera'] = [actions['camera_0'] - 5, actions['camera_1'] - 5]
 
         # take a step in the environment
         obs, reward, done, info = env.step(actions)
@@ -72,7 +80,8 @@ def worker(env_name, queue):
 
     env.close()
     
-    model.save('world.pth', 'vision.pth')
+    if not TEST:
+        model.save('world.pth', 'vision.pth')
 
 
 def main():
@@ -99,12 +108,12 @@ def main():
 if __name__ == '__main__':
     # model = WorldManager(
     #     image_size=64,
-    #     patch_size=4,
-    #     hidden_dim=384,
-    #     num_heads=6,
-    #     num_layers=4,
-    #     num_vision_encode_layers=4,
-    #     num_vision_decode_layers=2,
+    #     patch_size=8,
+    #     hidden_dim=768,
+    #     num_heads=12,
+    #     num_layers=12,
+    #     num_vision_encode_layers=12,
+    #     num_vision_decode_layers=4,
     #     actions_dict=action_space,
     #     device='cuda:0' if torch.cuda.is_available() else 'cpu',
     # )

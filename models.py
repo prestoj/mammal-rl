@@ -130,7 +130,7 @@ class VisionManager:
         num_layers_encode,
         num_layers_decode,
         device,
-        max_lr=1e-4,
+        max_lr=1e-5,
         batch_size=32,
         warmup_steps=10000,
         total_steps=100000,
@@ -247,9 +247,14 @@ class VisionManager:
             image = image.unsqueeze(0).to(self.device)
 
         with torch.no_grad():
-            reconstructions, _ = self.ema_model.forward_encode(image, mask_ratio=1.0)
+            encoded, _ = self.ema_model.forward_encode(image, mask_ratio=1.0)
+            
+            # reconstruction, _ = self.ema_model.forward(image, mask_ratio=1.0)
+            # reconstruction = reconstruction[0].permute(1, 2, 0).cpu().detach().numpy() * 0.25 + 0.5
+            # plt.imshow(reconstruction)
+            # plt.show()
 
-        return image, reconstructions
+        return image, encoded
 
     def save(self, path):
         torch.save({
@@ -362,11 +367,11 @@ class WorldManager:
         num_vision_decode_layers,
         actions_dict,
         device,
-        max_lr=1e-4,
+        max_lr=1e-5,
         batch_size=32,
         warmup_steps=10000,
         trajectory_length=256,
-        dataset_size=1024,
+        dataset_size=512,
         reward_discount=0.98
     ):
         self.device = device
@@ -383,7 +388,7 @@ class WorldManager:
             batch_size,
             warmup_steps,
             total_steps=100000,
-            ema_decay=0.999
+            ema_decay=0.9999
         )
 
         self.model = WorldModel(
@@ -408,7 +413,6 @@ class WorldManager:
         self.SARS_dataset = []
         self.trajectory_length = trajectory_length
         self.dataset_size = dataset_size
-        self.data_points_added_since_last_step = 0
         self.reward_discount = reward_discount
 
     def update_learning_rate(self):
@@ -457,7 +461,7 @@ class WorldManager:
         action_loss = action_loss / total_num_actions
         action_entropy = action_entropy / total_num_actions
 
-        loss = (value_loss + state_loss + action_loss - 1e-3 * action_entropy) / 3
+        loss = (value_loss + state_loss + action_loss - 1e-4 * action_entropy) / 3
 
         loss.backward()
         self.optimizer.step()
@@ -465,10 +469,19 @@ class WorldManager:
         if self.step % 10 == 0:
             print(f"WORLD | Step {self.step}: {loss.item():.4f} | Value: {value_loss.item():.4f} | State: {state_loss.item():.4f} | Action: {action_loss.item():.4f} | Entropy: {action_entropy.item():.4f}")
 
+        # print(0, '__________________________________________________')
+        # for i in range(len(self.SARS_dataset)):
+        #     print(self.SARS_dataset[i]['priority'])
         for i in range(len(batched_SARS)):
             self.SARS_dataset[i]['priority'] = value_loss_itemized[i].detach().item()
+        # print(1, '__________________________________________________')
+        # for i in range(len(self.SARS_dataset)):
+        #     print(self.SARS_dataset[i]['priority'])
 
         self.SARS_dataset = sorted(self.SARS_dataset, key=lambda x: x['priority'], reverse=True)
+        # print(2, '__________________________________________________')
+        # for i in range(len(self.SARS_dataset)):
+        #     print(self.SARS_dataset[i]['priority'])
 
     def add_most_recent_SARS_to_queue(self):
         self.SARS_queue.append(self.most_recent_SARS)
@@ -492,11 +505,12 @@ class WorldManager:
                 self.SARS_dataset = self.SARS_dataset[:-1]
             self.SARS_queue = self.SARS_queue[1:]
 
-            self.data_points_added_since_last_step += 1
-            # only looking at batch_size // 2 because I want half the data to come from new data and the other half to be the highest priority data
-            if self.data_points_added_since_last_step == self.batch_size // 2:
+            n_unprocessed = 0
+            for SARS_priority in self.SARS_dataset:
+                if SARS_priority['priority'] is None:
+                    n_unprocessed += 1
+            if n_unprocessed == self.batch_size:
                 self.learn()
-                self.data_points_added_since_last_step = 0
 
     def get_action_from_environment(self, image, reward):
         image, image_encoded = self.vision_manager.encode_image(image, learn_from_image=True)
@@ -518,6 +532,7 @@ class WorldManager:
         
         self.most_recent_SARS[0] = image
         self.most_recent_SARS[1] = chosen_actions
+
         return chosen_actions
 
     def save(self, path, vision_path):
